@@ -273,15 +273,30 @@ app.get('/api/get_balance', requireAuth, (req, res) => {
 app.get('/api/get_transactions', requireAuth, (req, res) => {
     const limit = parseInt(req.query.limit) || 50;
     const offset = parseInt(req.query.offset) || 0;
+    const type = req.query.type;
     
-    db.all(`
+    let query = `
         SELECT t.*, u.name as target_name 
         FROM transactions t
         LEFT JOIN users u ON t.target_user_id = u.id
         WHERE t.user_id = ?
-        ORDER BY t.created_at DESC
-        LIMIT ? OFFSET ?
-    `, [req.user.user_id, limit, offset], (err, transactions) => {
+    `;
+    
+    const params = [req.user.user_id];
+    
+    if (type && type !== 'all') {
+        if (type === 'transfer') {
+            query += ` AND (t.type = 'transfer_sent' OR t.type = 'transfer_received')`;
+        } else {
+            query += ` AND t.type = ?`;
+            params.push(type);
+        }
+    }
+    
+    query += ` ORDER BY t.created_at DESC LIMIT ? OFFSET ?`;
+    params.push(limit, offset);
+    
+    db.all(query, params, (err, transactions) => {
         if (err) {
             return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
         }
@@ -318,6 +333,312 @@ app.get('/api/get_transactions', requireAuth, (req, res) => {
         res.json({
             success: true,
             transactions: formattedTransactions
+        });
+    });
+});
+
+// Depositar
+app.post('/api/deposit', requireAuth, (req, res) => {
+    const { amount, description } = req.body;
+    
+    if (!amount || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'Valor inválido' });
+    }
+    
+    if (amount > 10000) {
+        return res.status(400).json({ success: false, message: 'Valor máximo por depósito: R$ 10.000,00' });
+    }
+    
+    db.serialize(() => {
+        db.run('BEGIN TRANSACTION');
+        
+        // Atualizar saldo
+        db.run(`
+            UPDATE users SET balance = balance + ? WHERE id = ?
+        `, [amount, req.user.user_id], function(err) {
+            if (err) {
+                db.run('ROLLBACK');
+                return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+            }
+            
+            // Registrar transação
+            db.run(`
+                INSERT INTO transactions (user_id, type, amount, description) 
+                VALUES (?, 'deposit', ?, ?)
+            `, [req.user.user_id, amount, description || 'Depósito realizado'], function(err) {
+                if (err) {
+                    db.run('ROLLBACK');
+                    return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                }
+                
+                db.run('COMMIT');
+                res.json({
+                    success: true,
+                    message: 'Depósito realizado com sucesso'
+                });
+            });
+        });
+    });
+});
+
+// Sacar
+app.post('/api/withdraw', requireAuth, (req, res) => {
+    const { amount, description } = req.body;
+    
+    if (!amount || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'Valor inválido' });
+    }
+    
+    // Verificar saldo
+    db.get("SELECT balance FROM users WHERE id = ?", [req.user.user_id], (err, user) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        if (!user || user.balance < amount) {
+            return res.status(400).json({ success: false, message: 'Saldo insuficiente' });
+        }
+        
+        db.serialize(() => {
+            db.run('BEGIN TRANSACTION');
+            
+            // Atualizar saldo
+            db.run(`
+                UPDATE users SET balance = balance - ? WHERE id = ?
+            `, [amount, req.user.user_id], function(err) {
+                if (err) {
+                    db.run('ROLLBACK');
+                    return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                }
+                
+                // Registrar transação
+                db.run(`
+                    INSERT INTO transactions (user_id, type, amount, description) 
+                    VALUES (?, 'withdraw', ?, ?)
+                `, [req.user.user_id, -amount, description || 'Saque realizado'], function(err) {
+                    if (err) {
+                        db.run('ROLLBACK');
+                        return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                    }
+                    
+                    db.run('COMMIT');
+                    res.json({
+                        success: true,
+                        message: 'Saque realizado com sucesso'
+                    });
+                });
+            });
+        });
+    });
+});
+
+// Verificar usuário para transferência
+app.post('/api/verify_user', requireAuth, (req, res) => {
+    const { email } = req.body;
+    
+    if (!email) {
+        return res.status(400).json({ success: false, message: 'Email é obrigatório' });
+    }
+    
+    db.get("SELECT id, name, email FROM users WHERE email = ?", [email], (err, user) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        if (!user) {
+            return res.status(404).json({ success: false, message: 'Usuário não encontrado' });
+        }
+        
+        res.json({
+            success: true,
+            user: {
+                id: user.id,
+                name: user.name,
+                email: user.email
+            }
+        });
+    });
+});
+
+// Transferir
+app.post('/api/transfer', requireAuth, (req, res) => {
+    const { recipient_email, amount, description } = req.body;
+    
+    if (!recipient_email || !amount || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'Dados inválidos' });
+    }
+    
+    // Verificar se não está transferindo para si mesmo
+    db.get("SELECT email FROM users WHERE id = ?", [req.user.user_id], (err, sender) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        if (sender.email === recipient_email) {
+            return res.status(400).json({ success: false, message: 'Você não pode transferir para si mesmo' });
+        }
+        
+        // Verificar saldo do remetente
+        db.get("SELECT balance FROM users WHERE id = ?", [req.user.user_id], (err, senderBalance) => {
+            if (err) {
+                return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+            }
+            
+            if (!senderBalance || senderBalance.balance < amount) {
+                return res.status(400).json({ success: false, message: 'Saldo insuficiente' });
+            }
+            
+            // Buscar destinatário
+            db.get("SELECT id, name FROM users WHERE email = ?", [recipient_email], (err, recipient) => {
+                if (err) {
+                    return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                }
+                
+                if (!recipient) {
+                    return res.status(404).json({ success: false, message: 'Destinatário não encontrado' });
+                }
+                
+                db.serialize(() => {
+                    db.run('BEGIN TRANSACTION');
+                    
+                    // Debitar do remetente
+                    db.run(`
+                        UPDATE users SET balance = balance - ? WHERE id = ?
+                    `, [amount, req.user.user_id], function(err) {
+                        if (err) {
+                            db.run('ROLLBACK');
+                            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                        }
+                        
+                        // Creditar ao destinatário
+                        db.run(`
+                            UPDATE users SET balance = balance + ? WHERE id = ?
+                        `, [amount, recipient.id], function(err) {
+                            if (err) {
+                                db.run('ROLLBACK');
+                                return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                            }
+                            
+                            // Registrar transação do remetente
+                            db.run(`
+                                INSERT INTO transactions (user_id, type, amount, description, target_user_id) 
+                                VALUES (?, 'transfer_sent', ?, ?, ?)
+                            `, [req.user.user_id, -amount, description || 'Transferência enviada', recipient.id], function(err) {
+                                if (err) {
+                                    db.run('ROLLBACK');
+                                    return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                                }
+                                
+                                // Registrar transação do destinatário
+                                db.run(`
+                                    INSERT INTO transactions (user_id, type, amount, description, target_user_id) 
+                                    VALUES (?, 'transfer_received', ?, ?, ?)
+                                `, [recipient.id, amount, description || 'Transferência recebida', req.user.user_id], function(err) {
+                                    if (err) {
+                                        db.run('ROLLBACK');
+                                        return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                                    }
+                                    
+                                    db.run('COMMIT');
+                                    res.json({
+                                        success: true,
+                                        message: 'Transferência realizada com sucesso'
+                                    });
+                                });
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
+
+// APIs Admin
+app.get('/api/admin/stats', requireAuth, (req, res) => {
+    if (!req.user.is_admin) {
+        return res.status(403).json({ success: false, message: 'Acesso negado' });
+    }
+    
+    const stats = {};
+    
+    // Total de usuários
+    db.get("SELECT COUNT(*) as count FROM users", (err, result) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        stats.total_users = result.count;
+        
+        // Transações hoje
+        db.get(`
+            SELECT COUNT(*) as count FROM transactions 
+            WHERE DATE(created_at) = DATE('now')
+        `, (err, result) => {
+            if (err) {
+                return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+            }
+            
+            stats.transactions_today = result.count;
+            
+            // Volume total
+            db.get("SELECT SUM(balance) as total FROM users", (err, result) => {
+                if (err) {
+                    return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+                }
+                
+                stats.total_volume = result.total || 0;
+                stats.active_users = stats.total_users; // Simplificado
+                
+                res.json({
+                    success: true,
+                    stats: stats
+                });
+            });
+        });
+    });
+});
+
+app.get('/api/admin/users', requireAuth, (req, res) => {
+    if (!req.user.is_admin) {
+        return res.status(403).json({ success: false, message: 'Acesso negado' });
+    }
+    
+    db.all(`
+        SELECT id, name, email, cpf, balance, is_admin, created_at 
+        FROM users 
+        ORDER BY created_at DESC
+    `, (err, users) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        res.json({
+            success: true,
+            users: users
+        });
+    });
+});
+
+app.get('/api/admin/transactions', requireAuth, (req, res) => {
+    if (!req.user.is_admin) {
+        return res.status(403).json({ success: false, message: 'Acesso negado' });
+    }
+    
+    db.all(`
+        SELECT t.*, u.name as user_name 
+        FROM transactions t
+        JOIN users u ON t.user_id = u.id
+        ORDER BY t.created_at DESC
+        LIMIT 100
+    `, (err, transactions) => {
+        if (err) {
+            return res.status(500).json({ success: false, message: 'Erro interno do servidor' });
+        }
+        
+        res.json({
+            success: true,
+            transactions: transactions
         });
     });
 });
