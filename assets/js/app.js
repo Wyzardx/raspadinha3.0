@@ -1,3 +1,6 @@
+// Configuração da API
+const API_BASE_URL = '/api';
+
 // Aplicação Principal - Gerenciamento de Telas
 class BankingApp {
     constructor() {
